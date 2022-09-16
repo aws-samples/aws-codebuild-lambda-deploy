@@ -1,0 +1,10 @@
+[
+  {
+    "ParameterKey" : "stackname",
+    "ParameterValue": "aws-samples-code-build-lambda"
+  },   
+  {
+    "ParameterKey" : "codecommitrepo",
+    "ParameterValue": "aws-samples-code-build-lambda"
+  }
+]

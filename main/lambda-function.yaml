@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Reusable cloudformation template to build lambda functions from code build jobs
+
+Parameters:
+
+  CodeBuildBucket:
+    Description: data type lambda codebuild bucket
+    Type: String
+
+  CodeBuildObjectKey:
+    Description: data type lambda codebuild object key
+    Type: String
+
+Resources:
+
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: role-lambda-function
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lambda-function
+      Code:
+        S3Bucket: !Ref CodeBuildBucket
+        S3Key: !Ref CodeBuildObjectKey
+      Handler: handler.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - LambdaFunctionRole
+          - Arn
+      Runtime: python3.9
+      MemorySize: 128
+      Environment:
+        Variables:
+          AwsRegion: !Ref AWS::Region
+      Timeout: 600

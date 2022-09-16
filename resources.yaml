@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: build code* deployment LOS Prototype
+
+Parameters:
+  codecommitrepo:
+    Type: String
+    Description: The name of the repo for this deployment
+  stackname:
+    Type: String
+    Description: Name of the cloudformation  stack
+
+Resources:
+  codebucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      VersioningConfiguration: 
+          Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        -
+          Key: Description
+          Value: Source code for L.OS data interface broker resources
+
+  codeBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref codebucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AllowSSLRequestsOnly
+          Effect: Deny
+          Principal: '*'
+          Action: 's3:*'
+          Resource:
+          - !GetAtt 'codebucket.Arn'
+          - !Sub '${codebucket.Arn}/*'
+          Condition:
+            Bool:
+              'aws:SecureTransport': false
+
+  codecommitnotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${stackname}-Notification-Topic"
+
+  codecommit:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref codecommitrepo
+      Triggers:
+      - Name: MyTrigger
+        DestinationArn:
+          Ref: codecommitnotification
+        Branches:
+        - main
+        Events:
+        - all
+
+  cloudformationrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service: [cloudformation.amazonaws.com]
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "*"
+                Effect: Allow
+                Resource: "*"
+
+  codepipelinerole:
+    DependsOn: cloudformationrole
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service: [codepipeline.amazonaws.com]
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "s3:*"
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:UpdateStack"
+                  - "cloudformation:CreateChangeSet"
+                  - "cloudformation:ExecuteChangeSet"
+                  - "cloudformation:DeleteChangeSet"
+                  - "cloudformation:DescribeChangeSet"
+                  - "cloudformation:SetStackPolicy"
+                  - "codebuild:StartBuild"
+                  - "codebuild:BatchGetBuilds"
+                  - "iam:PassRole"
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                  - "codecommit:*"
+                Effect: Allow
+                Resource: !GetAtt [codecommit, Arn]
+
+  codepipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref codebucket
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Sub "pipeline-${stackname}"
+      RoleArn: !GetAtt [codepipelinerole, Arn]
+      Stages:
+        - Name: CodeCommitSource
+          Actions:
+            - Name: TemplateSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              OutputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                BranchName: main
+                RepositoryName: !Ref codecommitrepo
+              RunOrder: "1"
+        - Name: CodeBuildStack
+          Actions:
+          - Name: codebuild-resources
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: "1"
+            RunOrder: 1
+            InputArtifacts:
+              - Name: TemplateSource
+            Configuration:
+              ActionMode: CREATE_UPDATE
+              RoleArn: !GetAtt [cloudformationrole, Arn]
+              Capabilities: CAPABILITY_NAMED_IAM
+              StackName: CodeBuildStack
+              TemplatePath: "TemplateSource::main/codebuild-lambda.yaml"
+          - Name: lambda-function-build
+            ActionTypeId:
+              Category: Build
+              Owner: AWS
+              Provider: CodeBuild
+              Version: '1'
+            RunOrder: 2
+            Configuration:
+              ProjectName: lambda-function-build
+            InputArtifacts:
+              - Name: TemplateSource
+            OutputArtifacts:
+              - Name: lambda-function-build-output
+          - Name: lambda-function-deploy
+            ActionTypeId:
+              Category: Deploy
+              Owner: AWS
+              Provider: CloudFormation
+              Version: "1"
+            RunOrder: 3
+            InputArtifacts:
+              - Name: TemplateSource
+              - Name: lambda-function-build-output
+            Configuration:
+              ActionMode: CREATE_UPDATE
+              RoleArn: !GetAtt [cloudformationrole, Arn]
+              Capabilities: CAPABILITY_NAMED_IAM
+              StackName: codebuild-lambda-deploy
+              TemplatePath: "TemplateSource::main/lambda-function.yaml"
+              ParameterOverrides: !Sub |
+                    {
+                      "CodeBuildBucket": {"Fn::GetArtifactAtt":["lambda-function-build-output", "BucketName"]},
+                      "CodeBuildObjectKey": {"Fn::GetArtifactAtt":["lambda-function-build-output", "ObjectKey"]}
+                    }
+
+  cloudwatcheventrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: 
+                  !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref codepipeline ] ] 
+
+  codecommitcloudwatchtrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Join [ '', [ 'arn:aws:codecommit:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref codecommit ] ]
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        -
+          Arn:
+            !Join [ '', [ 'arn:aws:codepipeline:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':', !Ref codepipeline ] ]
+          RoleArn: !GetAtt cloudwatcheventrole.Arn
+          Id: codepipeline-codepipeline
+
+  ParamCodeBucket:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /codecommit/bucket
+      Type: String
+      Value: !Ref codebucket
+      Description: SSM Parameter to store code bucket name
+
+  ParamCodeCommitRepo:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /codecommit/repo
+      Type: String
+      Value: !Ref codecommitrepo
+      Description: SSM Parameter to store repo name 
+
+Outputs:
+  codebucketname:
+    Value: !Ref codebucket
+    Description: Name of the s3 bucket name
+  codecommitarn:
+    Value: !GetAtt [codecommit, Arn]
+    Description: codecommit Arn
+  codecommitcloneurlssh:
+    Value: !GetAtt [codecommit, CloneUrlSsh]
+    Description: codecommit CloneUrlSsh
